@@ -1,0 +1,60 @@
+name: Run Windows 10 Enterprise VM (Dockur)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cpu_cores:
+        description: "Number of CPU cores"
+        required: true
+        default: "4"
+      ram_size:
+        description: "RAM size"
+        required: true
+        default: "16G"
+
+jobs:
+  windows-vm:
+    runs-on: ubuntu-latest # Note: Public repositories provide 4-core / 16GB RAM runners by default. For private repositories, consider using a larger runner to support a 16GB VM allocation.
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure KVM Permissions
+        run: |
+          echo "Verifying KVM device..."
+          ls -l /dev/kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Start Windows 10 Enterprise Container
+        run: |
+          docker run -d \
+            --name windows-vm \
+            -e "VERSION=10e" \
+            -e "CPU_CORES=${{ inputs.cpu_cores }}" \
+            -e "RAM_SIZE=${{ inputs.ram_size }}" \
+            -p 8006:8006 \
+            -p 3389:3389/tcp \
+            --device=/dev/kvm \
+            --device=/dev/net/tun \
+            --cap-add NET_ADMIN \
+            --stop-timeout 120 \
+            dockurr/windows
+
+      - name: Monitor Boot Logs
+        run: |
+          echo "Waiting for container initialization and image download..."
+          sleep 45
+          docker logs windows-vm --tail 50
+
+      - name: Expose via Cloudflare Tunnel (Web Access)
+        uses: cloudflare/cloudflared-action@v3
+        with:
+          command: tunnel --url http://localhost:8006
+        continue-on-error: true
+
+      - name: Keep Runner Alive
+        run: |
+          echo "Windows 10 Enterprise VM is running with KVM and 16GB RAM!"
+          sleep 10800
