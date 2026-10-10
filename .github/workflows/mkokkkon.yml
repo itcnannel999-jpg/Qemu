@@ -1,0 +1,77 @@
+name: "Windows 10 LTSC (Dockur, 16GB RAM, 256GB Disk)"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-windows:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: 1. Setup KVM Environment
+        run: |
+          echo "=== [STEP 1/3] Setting up KVM & Docker ==="
+          sudo apt-get update
+          sudo apt-get install -y curl
+          sudo chmod 666 /dev/kvm || true
+
+      - name: 2. Connect Tailscale
+        run: |
+          echo "=== [STEP 2/3] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="windows-dockur-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 3. Launch Windows 10 LTSC via Dockurr
+        run: |
+          echo "=== [STEP 3/3] Starting Windows Container ==="
+          
+          docker run -d \
+            --name windows \
+            --device=/dev/kvm \
+            --cap-add=NET_ADMIN \
+            -p 8006:8006 \
+            -p 3389:3389/tcp \
+            -p 3389:3389/udp \
+            -e VERSION="10l" \
+            -e RAM_SIZE="16G" \
+            -e STORAGE="256G" \
+            -e AUDIO="Y" \
+            --restart always \
+            dockurr/windows
+          
+          sleep 10
+
+      - name: 4. Monitor Status & Keep Alive
+        run: |
+          echo "=================================================="
+          echo " WINDOWS 10 LTSC READY"
+          echo "=================================================="
+          echo " OS Version   : Windows 10 LTSC (10l)"
+          echo " RAM          : 16 GB"
+          echo " Disk Size    : 256 GB"
+          echo " Audio        : Enabled"
+          echo " Tailscale IP : ${{ env.TAILSCALE_IP }}"
+          echo " Web VNC URL  : http://${{ env.TAILSCALE_IP }}:8006"
+          echo " RDP Access   : ${{ env.TAILSCALE_IP }}:3389"
+          echo "=================================================="
+          
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "Dockur Status Check | Tailscale IP: ${{ env.TAILSCALE_IP }} | $(date)"
+            docker ps --filter "name=windows"
+          done
