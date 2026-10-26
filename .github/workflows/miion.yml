@@ -1,0 +1,153 @@
+name: Windows 10 QEMU (16GB RAM + 256GB Disk + Removable USB)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win10-qemu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM & Storage Tools
+        run: |
+          echo "=== [STEP 1/4] Installing QEMU, KVM & Tools ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-gui \
+            qemu-utils \
+            genisoimage \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2 \
+            p7zip-full \
+            unzip \
+            pulseaudio
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Main Virtual Disk (256GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 256G
+
+          echo "=== Creating Empty USB Flash Drive (32GB RAW) ==="
+          qemu-img create -f raw /tmp/usb_flash_32G.img 32G
+
+      - name: 2. Download Windows 10 ISO, Chrome, Drivers & Build Software ISO
+        run: |
+          echo "=== [STEP 2/4] Downloading ISOs & Software ==="
+          
+          WIN10_ISO_URL="https://archive.org/download/WindowsVersionsArchive/Windows10_x64.iso"
+          VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.262-2/virtio-win-0.1.262.iso"
+          SHAREDGL_URL="https://github.com/dmaivel/sharedgl/releases/download/v0.10.0/sharedgl-v0.10.0-windows.zip"
+          CHROME_URL="https://www.softportal.com/getsoft-7868-google-chrome-1.html"
+
+          echo "Downloading Windows 10 ISO..."
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o win_setup.iso "$WIN10_ISO_URL" || wget -O /tmp/win_setup.iso "$WIN10_ISO_URL"
+
+          echo "Downloading VirtIO Drivers ISO..."
+          wget -O /tmp/virtio.iso "$VIRTIO_URL"
+
+          echo "Downloading and Unpacking SharedGL..."
+          mkdir -p /tmp/sharedgl
+          wget -O /tmp/sharedgl.zip "$SHAREDGL_URL"
+          unzip -o /tmp/sharedgl.zip -d /tmp/sharedgl/
+
+          mkdir -p /tmp/custom_iso/Chrome
+          echo "Downloading Google Chrome Setup..."
+          wget -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -O /tmp/custom_iso/Chrome/ChromeSetup.exe "$CHROME_URL" || aria2c -o /tmp/custom_iso/Chrome/ChromeSetup.exe "$CHROME_URL"
+
+          echo "Extracting VirtIO Drivers..."
+          7z x /tmp/virtio.iso -o/tmp/custom_iso/VirtIO_Drivers -y
+
+          echo "Copying SharedGL..."
+          cp -r /tmp/sharedgl /tmp/custom_iso/SharedGL
+
+          echo "Generating Custom Drivers & Chrome ISO..."
+          genisoimage -o /tmp/software.iso -R -J /tmp/custom_iso
+
+      - name: 3. Connect Tailscale
+        run: |
+          echo "=== [STEP 3/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTHKEY }}"
+          
+          if [ -n "$AUTH_KEY" ]; then
+            sudo tailscale up --authkey="$AUTH_KEY" --hostname="win10-qemu-runner-${{ github.run_id }}" --accept-routes || true
+          fi
+
+          TS_IP=$(tailscale ip -4 || true)
+          if [ -z "$TS_IP" ]; then
+            timeout 15s sudo tailscale up --hostname="win10-qemu-runner-${{ github.run_id }}" --accept-routes || true
+            sudo tailscale up --hostname="win10-qemu-runner-${{ github.run_id }}" --accept-routes > /dev/null 2>&1 &
+            
+            RETRIES=0
+            while [ -z "$TS_IP" ] && [ $RETRIES -lt 60 ]; do
+                TS_IP=$(tailscale ip -4 || true)
+                sleep 3
+                RETRIES=$((RETRIES+1))
+            done
+          fi
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale failed!"
+            exit 1
+          fi
+
+          echo "Tailscale IP: $TS_IP"
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4. Launch QEMU Windows 10 & noVNC Web Access
+        run: |
+          echo "=== [STEP 4/4] Starting QEMU Windows 10 Machine ==="
+          
+          export QEMU_AUDIO_DRV=none
+
+          # Запуск QEMU: 16 GB RAM + 256GB Disk + Removable USB Flash + Intel Audio
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine pc,accel=kvm \
+            -m 16384 \
+            -smp 4,sockets=1,cores=4,threads=1 \
+            -cpu host \
+            -boot d \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk,cache=unsafe,aio=threads \
+            -drive file=/tmp/win_setup.iso,index=1,media=cdrom \
+            -drive file=/tmp/software.iso,index=2,media=cdrom \
+            -drive file=/tmp/usb_flash_32G.img,format=raw,if=none,id=usbdrive \
+            -device qemu-xhci,id=xhci \
+            -device usb-storage,bus=xhci.0,drive=usbdrive,removable=true \
+            -device usb-tablet,bus=xhci.0 \
+            -device intel-hda \
+            -device hda-duplex \
+            -vga virtio \
+            -vnc 127.0.0.1:0 \
+            -netdev user,id=net0 \
+            -device e1000,netdev=net0 \
+            -daemonize
+
+          sleep 5
+
+          NOVNC_DIR="/usr/share/novnc"
+          websockify --web "$NOVNC_DIR" --heartbeat=10 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 10 SETUP READY"
+          echo " CPU Mode      : Host Passthrough (-cpu host)"
+          echo " RAM Allocated : 16 GB (16384 MB)"
+          echo " Main Disk     : 256 GB (qcow2)"
+          echo " USB Flash     : 32 GB (Removable USB Storage)"
+          echo " Software CD   : Chrome + VirtIO + SharedGL"
+          echo " Web VNC URL   : http://$TAILSCALE_IP:8006/vnc.html"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Running | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
