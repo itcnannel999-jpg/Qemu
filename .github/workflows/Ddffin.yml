@@ -1,0 +1,74 @@
+name: macOS Runner with noVNC & Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-macos-runner:
+    runs-on: macos-14
+
+    steps:
+      - name: Install Tailscale & Git
+        run: |
+          brew install tailscale git
+
+      - name: Start Tailscale Service
+        run: |
+          sudo brew services start tailscale
+          sleep 3
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-macos --accept-routes
+          
+          TS_IP=""
+          for i in {1..15}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null || true)
+            if [ -n "$TS_IP" ]; then
+              break
+            fi
+            sleep 2
+          done
+          
+          if [ -z "$TS_IP" ]; then
+            echo "Error: Failed to get Tailscale IP."
+            exit 1
+          fi
+          
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Set Runner Password
+        run: |
+          sudo sysadminctl -adminUser runner -adminPassword "" -setPassword -user runner -newPassword "password123" || true
+
+      - name: Enable macOS Screen Sharing (VNC)
+        run: |
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          sudo launchctl kickstart -k system/com.apple.screensharing || true
+
+      - name: Setup noVNC and Start Web Access
+        run: |
+          # Устанавливаем websockify с обходом системных ограничений Python
+          pip3 install websockify --break-system-packages
+          
+          # Скачиваем стабильную версию noVNC (без ошибок шифрования в браузерах)
+          git clone --branch v1.4.0 --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+          
+          # Отключаем обязательный запрос пароля/логина в самом интерфейсе noVNC (авто-соединение)
+          sed -i '' 's/password_input.focus();/\\/password_input.focus();/' /tmp/novnc/vnc.html || true
+
+          # Запускаем websockify, проксируя порт 8080 на системный VNC порт macOS (5900)
+          websockify --web=/tmp/novnc 8080 localhost:5900 &
+
+      - name: Connection Details & Keep Alive
+        run: |
+          echo "=== MACOS RUNNER (noVNC) ACCESS ==="
+          echo "Open this link in your browser (via Tailscale):"
+          echo "http://${{ env.TS_IP }}:8080/vnc.html?host=${{ env.TS_IP }}&port=8080&autoconnect=1&resize=scale"
+          echo ""
+          echo "(Если macOS внутри запросит системный логин/пароль при входе:)"
+          echo "Username: runner"
+          echo "Password: password123"
+          echo "==================================="
+          sleep 21600
