@@ -1,0 +1,141 @@
+name: Custom Windows 7 QEMU (Intel Core i7-740QM & Firefox)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win7-firefox:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM & Storage Tools
+        run: |
+          echo "=== [STEP 1/5] Installing QEMU, KVM & Tools ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            genisoimage \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Main Virtual Disk (64GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 64G
+
+          echo "=== Creating Empty USB Flash Drive (40GB RAW) ==="
+          qemu-img create -f raw /tmp/usb_flash_40G.img 40G
+
+      - name: 2. Download Windows 7 ISO
+        run: |
+          echo "=== [STEP 2/5] Downloading Windows 7 ISO ==="
+          ISO_URL="https://archive.org/download/windows-7-build-7264/Windows7_Build_7264_x64.iso"
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o win7.iso "$ISO_URL" || wget -O /tmp/win7.iso "$ISO_URL"
+          ls -lh /tmp/win7.iso
+
+      - name: 3. Download Firefox & Build Extra Software ISO
+        run: |
+          echo "=== [STEP 3/5] Downloading Firefox & Building Software ISO ==="
+          
+          FIREFOX_URL="https://ftp.mozilla.org/pub/firefox/releases/153.7.0esr/win64/en-US/Firefox%20Setup%20153.7.0esr.exe"
+          
+          mkdir -p /tmp/custom_iso/Firefox
+          echo "Downloading Firefox Setup..."
+          wget -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -O /tmp/custom_iso/Firefox/Firefox_Setup.exe "$FIREFOX_URL" || aria2c -o /tmp/custom_iso/Firefox/Firefox_Setup.exe "$FIREFOX_URL"
+
+          echo "Generating Software CD-ROM ISO..."
+          genisoimage -o /tmp/software.iso -R -J /tmp/custom_iso
+          ls -lh /tmp/software.iso
+
+      - name: 4. Connect Tailscale
+        run: |
+          echo "=== [STEP 4/5] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTHKEY }}"
+          
+          if [ -n "$AUTH_KEY" ]; then
+            sudo tailscale up --authkey="$AUTH_KEY" --hostname="win7-qemu-runner-${{ github.run_id }}" --accept-routes || true
+          fi
+
+          TS_IP=$(tailscale ip -4 || true)
+          if [ -z "$TS_IP" ]; then
+            timeout 15s sudo tailscale up --hostname="win7-qemu-runner-${{ github.run_id }}" --accept-routes || true
+            sudo tailscale up --hostname="win7-qemu-runner-${{ github.run_id }}" --accept-routes > /dev/null 2>&1 &
+            
+            RETRIES=0
+            while [ -z "$TS_IP" ] && [ $RETRIES -lt 60 ]; do
+                TS_IP=$(tailscale ip -4 || true)
+                sleep 3
+                RETRIES=$((RETRIES+1))
+            done
+          fi
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale failed to get IP!"
+            exit 1
+          fi
+
+          echo "Tailscale IP: $TS_IP"
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 5. Launch QEMU Windows 7 & noVNC Web Access
+        run: |
+          echo "=== [STEP 5/5] Starting QEMU Windows 7 Machine ==="
+          
+          # Берем IP из переменной окружения
+          CURRENT_IP="${{ env.TAILSCALE_IP }}"
+          if [ -z "$CURRENT_IP" ]; then
+            CURRENT_IP=$(tailscale ip -4 || echo "127.0.0.1")
+          fi
+
+          # Запуск QEMU с кастомным процессором i7-740QM, 16GB RAM, диском 64ГБ, флешкой 40ГБ и CD-ROM с Firefox
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -m 16384 \
+            -smp 4,sockets=1,cores=4,threads=1 \
+            -cpu host,model-id="Intel(R) Core(TM) i7-740QM CPU @ 1.73GHz",check=false \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk \
+            -drive file=/tmp/win7.iso,index=1,media=cdrom \
+            -drive file=/tmp/software.iso,index=2,media=cdrom \
+            -drive file=/tmp/usb_flash_40G.img,format=raw,if=none,id=usbdrive \
+            -device qemu-xhci,id=xhci \
+            -device usb-storage,bus=xhci.0,drive=usbdrive,removable=true \
+            -vga std \
+            -boot d \
+            -vnc 127.0.0.1:0 \
+            -net nic,model=e1000 \
+            -net user \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          NOVNC_DIR="/usr/share/novnc"
+          websockify --web "$NOVNC_DIR" --heartbeat=10 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 7 QEMU READY (INTEL CORE i7-740QM)"
+          echo "=================================================="
+          echo " OS Image       : Windows 7 Build 7264 (x64)"
+          echo " CPU Model      : Intel(R) Core(TM) i7-740QM CPU @ 1.73GHz"
+          echo " RAM            : 16 GB (16384 MB)"
+          echo " Main Storage   : 64 GB"
+          echo " Removable USB  : 40 GB Flash Drive"
+          echo " Software CD    : Firefox 153.7.0 ESR Setup"
+          echo " Tailscale IP   : $CURRENT_IP"
+          echo " Web VNC URL    : http://$CURRENT_IP:8006/vnc.html"
+          echo "=================================================="
+
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Running | Tailscale IP: $CURRENT_IP | $(date)"
+          done
